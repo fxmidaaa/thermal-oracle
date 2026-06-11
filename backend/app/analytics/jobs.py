@@ -3,6 +3,7 @@
 прогон любого диапазона безопасен (architecture.md §4.4, §5.6).
 """
 import datetime as dt
+import json
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -144,22 +145,27 @@ def ambient_for_day(
 async def detect_windows_for_device(
     conn: asyncpg.Connection, device: asyncpg.Record,
     t0: dt.datetime, t1: dt.datetime, params: AnalysisParams,
-) -> int:
-    """Детекция окон + Rth на [t0, t1) для обоих доменов. Возвращает число
-    сохранённых окон. Окна без доступной ambient-оценки пропускаются (появятся
-    при reprocess после первой ночи устройства)."""
+) -> tuple[int, dict[str, float]]:
+    """Детекция окон + Rth на [t0, t1) для обоих доменов. Возвращает (число
+    сохранённых окон, {domain: epoch-начало сессии, открытой на краю t1}).
+    Окна без доступной ambient-оценки пропускаются (появятся при reprocess
+    после первой ночи устройства)."""
     device_id = device["id"]
     tz = _tz(device["timezone"])
     series = await _load_series(conn, device_id, t0, t1)
     if series["ts"].size == 0:
-        return 0
+        return 0, {}
     estimates = await _ambient_lookup(conn, device_id, params)
     saved = 0
+    open_since: dict[str, float] = {}
 
     for domain, power_col, temp_col in DOMAINS:
-        windows, rejected = detect_stable_windows(
-            series["ts"], series[power_col], series[temp_col], series["fan_rpm"], params
+        windows, rejected, open_ts = detect_stable_windows(
+            series["ts"], series[power_col], series[temp_col], series["fan_rpm"],
+            params, until_s=t1.timestamp(),
         )
+        if open_ts is not None:
+            open_since[domain] = open_ts
         if rejected:
             log.debug("windows.rejected", device_id=str(device_id), domain=domain,
                       reasons=dict(rejected))
@@ -199,30 +205,41 @@ async def detect_windows_for_device(
                     MODEL_VERSION,
                 )
                 saved += 1
-    return saved
+    return saved, open_since
 
 
 async def detect_windows_job(pool: asyncpg.Pool, params: AnalysisParams) -> None:
     """Инкрементальный проход: [watermark − LOOKBACK, now − WATERMARK).
-    Эмитятся только закрытые окна; открытое на правом крае дозреет к
-    следующему прогону, а upsert схлопнет пересечения."""
+    Эмитятся только закрытые окна; открытое на правом крае дозреет: его начало
+    хранится в analytics_state.open_since, и следующий прогон перечитывает
+    серию от него — чанки воспроизводятся с теми же ключами, upsert идемпотентен.
+    Кап перечитки 24 ч: «вечная» сессия не должна раздувать каждый прогон."""
     now = dt.datetime.now(dt.UTC)
     until = now - dt.timedelta(seconds=WATERMARK_S)
+    floor = now - dt.timedelta(hours=24)
     async with pool.acquire() as conn:
         for device in await _active_devices(conn):
             dev_params = params.with_overrides(device["analysis_overrides"])
-            state = await conn.fetchval(
-                "SELECT windows_processed_until FROM analytics_state WHERE device_id = $1",
+            state = await conn.fetchrow(
+                """SELECT windows_processed_until, open_since
+                   FROM analytics_state WHERE device_id = $1""",
                 device["id"],
             )
-            t0 = (state or (now - dt.timedelta(hours=24))) - dt.timedelta(seconds=LOOKBACK_S)
-            saved = await detect_windows_for_device(conn, device, t0, until, dev_params)
+            watermark = state["windows_processed_until"] if state else None
+            t0 = (watermark or floor) - dt.timedelta(seconds=LOOKBACK_S)
+            prev_open = json.loads(state["open_since"]) if state and state["open_since"] else {}
+            if prev_open:
+                oldest = dt.datetime.fromtimestamp(min(prev_open.values()), dt.UTC)
+                t0 = max(min(t0, oldest), floor)
+            saved, open_since = await detect_windows_for_device(
+                conn, device, t0, until, dev_params)
             await conn.execute(
-                """INSERT INTO analytics_state (device_id, windows_processed_until)
-                   VALUES ($1, $2)
+                """INSERT INTO analytics_state (device_id, windows_processed_until, open_since)
+                   VALUES ($1, $2, $3)
                    ON CONFLICT (device_id) DO UPDATE
-                       SET windows_processed_until = EXCLUDED.windows_processed_until""",
-                device["id"], until,
+                       SET windows_processed_until = EXCLUDED.windows_processed_until,
+                           open_since = EXCLUDED.open_since""",
+                device["id"], until, json.dumps(open_since),
             )
             if saved:
                 log.info("windows.saved", device_id=str(device["id"]), n=saved)
@@ -302,6 +319,15 @@ async def update_trends_for_device(
             medians, params.cusum_k_sigma, params.cusum_h_sigma
         )
         seg = changepoints[-1] if changepoints else 0
+        if changepoints:
+            # §5.5: чейнджпойнт ⇒ предложение подтвердить событие обслуживания.
+            # Эпоху НЕ режет (kind не в EPOCH_RESET_KINDS) — псевдо-граница
+            # тренда уже обеспечена сегментом seg; базлайн ждёт подтверждения.
+            step_pct = 100.0 * (medians[seg] - medians[seg - 1]) / medians[seg - 1]
+            await _suggest_regime_change(
+                conn, device_id, domain, stratum,
+                daily[seg]["day"], step_pct, _tz(tz_name),
+            )
 
         data_quality = "ok"
         trend = None
@@ -324,12 +350,17 @@ async def update_trends_for_device(
             device_id, domain, stratum, params.quality_min,
             epoch_start, params.baseline_days, params.baseline_min_windows,
         )
+        # фильтр по эпохе обязателен: сразу после repaste в «последних 7 днях»
+        # ещё лежат окна ПРОШЛОЙ эпохи — без него degradation_pct сравнивал бы
+        # новый базлайн со смесью двух паст (§5.5: уровень живёт внутри эпохи)
         current = await conn.fetchval(
             """SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY rth)
                FROM rth_windows
                WHERE device_id = $1 AND domain = $2 AND stratum = $3 AND quality >= $4
-                 AND window_start >= now() - make_interval(days => $5)""",
+                 AND window_start >= now() - make_interval(days => $5)
+                 AND window_start >= $6::timestamptz""",
             device_id, domain, stratum, params.quality_min, params.current_days,
+            epoch_start,
         )
 
         degradation_pct = None
@@ -347,8 +378,9 @@ async def update_trends_for_device(
                     """SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY p_tail)
                        FROM rth_windows
                        WHERE device_id = $1 AND domain = $2 AND stratum = $3
-                         AND window_start >= now() - interval '30 days'""",
-                    device_id, domain, stratum,
+                         AND window_start >= now() - interval '30 days'
+                         AND window_start >= $4::timestamptz""",
+                    device_id, domain, stratum, epoch_start,
                 )
                 t_amb_typ = await conn.fetchval(
                     """SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY t_ambient)
@@ -396,6 +428,37 @@ async def update_trends_for_device(
             slope_mkw, ci_low, ci_high, forecast_date, score,
             data_quality, diagnosis, MODEL_VERSION,
         )
+
+
+async def _suggest_regime_change(
+    conn: asyncpg.Connection, device_id: uuid.UUID, domain: str,
+    stratum: str, day: dt.date, step_pct: float, tz: ZoneInfo,
+) -> None:
+    """Предложение из CUSUM (§5.5): «около этого дня сменился режим —
+    подтвердите, что это было» (чистка / кривая вентиляторов / андервольт).
+
+    Дедуп — NOT EXISTS в ±3 дня: оценка дня ступеньки дрожит на ±1 день по
+    мере накопления данных, и cpu/gpu обычно стреляют от одной физической
+    причины — второй строки про то же событие быть не должно. Подтверждение
+    юзер делает обычным POST /maintenance с настоящим видом работ."""
+    ts = dt.datetime.combine(day, dt.time.min, tzinfo=tz).astimezone(dt.UTC)
+    direction = "вверх" if step_pct > 0 else "вниз"
+    note = (f"CUSUM: ступенька дневной медианы Rth {direction} на "
+            f"{abs(step_pct):.1f}% ({domain}/{stratum}) около {day.isoformat()}. "
+            f"Подтвердите событие: чистка, кривая вентиляторов, андервольт?")
+    status = await conn.execute(
+        """INSERT INTO maintenance_events (device_id, ts, kind, source, note)
+           SELECT $1, $2, 'regime_change', 'changepoint_suggested', $3
+           WHERE NOT EXISTS (
+               SELECT 1 FROM maintenance_events
+               WHERE device_id = $1 AND source = 'changepoint_suggested'
+                 AND ts BETWEEN $2::timestamptz - interval '3 days'
+                            AND $2::timestamptz + interval '3 days')""",
+        device_id, ts, note,
+    )
+    if status.endswith("1"):
+        log.info("trends.changepoint_suggested", device_id=str(device_id),
+                 domain=domain, day=str(day), step_pct=round(step_pct, 1))
 
 
 async def _diagnose(
@@ -448,8 +511,11 @@ async def reprocess_job(pool: asyncpg.Pool, params: AnalysisParams) -> None:
     """Опоздавшие данные (дренаж спула агента): пересчёт ambient затронутых
     дней и окон затронутого диапазона (architecture.md §4.4)."""
     async with pool.acquire() as conn:
+        # device_id СОЗНАТЕЛЬНО алиасится в id: detect_windows_for_device
+        # читает device["id"] — без алиаса туда уезжал int-id строки очереди
         entries = await conn.fetch(
-            """SELECT q.id, q.device_id, q.range_start, q.range_end,
+            """SELECT q.id AS queue_id, q.device_id AS id,
+                      q.range_start, q.range_end,
                       d.timezone, d.analysis_overrides
                FROM reprocess_queue q JOIN devices d ON d.id = q.device_id
                WHERE q.processed_at IS NULL
@@ -462,16 +528,26 @@ async def reprocess_job(pool: asyncpg.Pool, params: AnalysisParams) -> None:
             last_day = entry["range_end"].astimezone(tz).date()
             while day <= last_day:
                 await estimate_ambient_for_device_day(
-                    conn, entry["device_id"], day, tz, dev_params)
+                    conn, entry["id"], day, tz, dev_params)
                 day += dt.timedelta(days=1)
-            await detect_windows_for_device(
-                conn, entry,
-                entry["range_start"] - dt.timedelta(seconds=REPROCESS_PAD_S),
-                entry["range_end"] + dt.timedelta(seconds=REPROCESS_PAD_S),
-                dev_params,
-            )
+            pad = dt.timedelta(seconds=REPROCESS_PAD_S)
+            t0, t1 = entry["range_start"] - pad, entry["range_end"] + pad
+            async with conn.transaction():
+                # Пересчёт отрезка = детерминированная функция от raw (§4.4):
+                # старые окна внутри диапазона выкидываем, а не апсертим —
+                # у окна, чья граница сдвинулась на полных данных, другой
+                # window_start, и upsert оставил бы рядом стухший дубль
+                # (наблюдалось живьём: пересечения от инкрементальных прогонов)
+                await conn.execute(
+                    """DELETE FROM rth_windows
+                       WHERE device_id = $1
+                         AND window_start >= $2 AND window_end <= $3""",
+                    entry["id"], t0, t1,
+                )
+                await detect_windows_for_device(conn, entry, t0, t1, dev_params)
             await conn.execute(
-                "UPDATE reprocess_queue SET processed_at = now() WHERE id = $1", entry["id"])
+                "UPDATE reprocess_queue SET processed_at = now() WHERE id = $1",
+                entry["queue_id"])
         if entries:
             log.info("reprocess.done", ranges=len(entries))
 

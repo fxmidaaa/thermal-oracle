@@ -10,6 +10,17 @@
 NumPy (bridge провалов ≤ 3 с между True-ранами), а не через цикл по сэмплам.
 NaN мощности трактуется как «ниже порога» (молчащий сенсор = провал, который
 закроет грейс либо порвёт окно — честнее, чем интерполяция нагрева).
+
+Правый край (until_s): сессия, упирающаяся в границу запрошенного диапазона,
+ещё ОТКРЫТА — её последний чанк не эмитится (дозреет к следующему прогону),
+а начало рана возвращается третьим элементом для персиста в analytics_state.
+Без этого обрезанный край сессии эмитился как «закрытое» окно: CV на огрызке
+проходил гейт, и в rth_windows рождались фантомные точки, которые полные
+данные потом честно браковали, но перезаписать их было некому (другой
+window_start). Если же агент молчит ≥ gap_split_s перед until — это обычный
+гэп (виртуальный следующий сэмпл не пришёл), окно закрывается по последнему
+сэмплу; опоздавший дренаж спула поправит reprocess. until_s=None — серия
+полная, закрывается всё (юнит-тесты, исторические пересчёты целиком).
 """
 from collections import Counter
 from dataclasses import dataclass
@@ -48,29 +59,42 @@ def detect_stable_windows(
     temp: np.ndarray,
     rpm: np.ndarray,
     params: AnalysisParams,
-) -> tuple[list[WindowStats], Counter]:
-    """→ (прошедшие все гейты окна, счётчик причин отбраковки)."""
+    until_s: float | None = None,
+) -> tuple[list[WindowStats], Counter, float | None]:
+    """→ (прошедшие все гейты окна, счётчик причин отбраковки,
+    начало рана, открытого на правом крае until_s, — None если такого нет)."""
     rejected: Counter = Counter()
     out: list[WindowStats] = []
     if ts.size == 0:
-        return out, rejected
+        return out, rejected, None
     temp_f = median_filter(temp, params.medfilt_s)
+    # последний сэмпл «свежий» относительно границы → хвост серии ещё в полёте
+    edge_live = until_s is not None and (until_s - float(ts[-1])) < params.gap_split_s
+    open_start: float | None = None
 
     for s0, s1 in split_on_gaps(ts, params.gap_split_s):
         stay = np.where(np.isnan(power[s0:s1]), False, power[s0:s1] >= params.load_exit_w)
         stay = bridge_short_gaps(stay, ts[s0:s1], params.dip_grace_s)
         for r0, r1 in runs(stay):
+            run_open = edge_live and s0 + r1 == ts.size
             seg_power = power[s0 + r0 : s0 + r1]
             above_enter = np.flatnonzero(seg_power > params.load_enter_w)
             if above_enter.size == 0:
                 continue  # нагрузка так и не пересекла порог входа
             w0 = s0 + r0 + int(above_enter[0])  # окно открывается на P > 35 Вт
             w1 = s0 + r1
-            for c0, c1 in _chunks(ts, w0, w1, params.window_max_s):
+            chunks = _chunks(ts, w0, w1, params.window_max_s)
+            if run_open:
+                # последний чанк обрезан границей, не концом нагрузки — дозреет;
+                # перечитка со start рана воспроизведёт чанки с теми же ключами
+                open_start = float(ts[s0 + r0])
+                chunks = chunks[:-1]
+                rejected["open_right_edge"] += 1  # диагностика, не брак
+            for c0, c1 in chunks:
                 stats = _window_stats(ts, power, temp_f, rpm, c0, c1, params, rejected)
                 if stats is not None:
                     out.append(stats)
-    return out, rejected
+    return out, rejected, open_start
 
 
 def _chunks(ts: np.ndarray, w0: int, w1: int, max_s: float) -> list[tuple[int, int]]:

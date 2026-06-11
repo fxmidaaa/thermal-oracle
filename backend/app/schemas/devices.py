@@ -45,6 +45,7 @@ class HealthOut(BaseModel):
     slope_ci_low: float | None
     slope_ci_high: float | None
     forecast_throttle_date: dt.date | None
+    days_to_critical: int | None = None  # удобство фронта: дни до прогнозной даты
     health_score: int | None
     data_quality: str
     diagnosis: str

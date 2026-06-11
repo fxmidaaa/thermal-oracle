@@ -127,7 +127,17 @@ async def device_health(
                FROM device_health WHERE device_id = $1 ORDER BY domain""",
             device_id,
         )
-    return [HealthOut(**dict(r)) for r in rows]
+    today = dt.date.today()
+    return [
+        HealthOut(
+            **dict(r),
+            days_to_critical=(
+                (r["forecast_throttle_date"] - today).days
+                if r["forecast_throttle_date"] is not None else None
+            ),
+        )
+        for r in rows
+    ]
 
 
 @router.get("/{device_id}/trend", response_model=TrendOut)

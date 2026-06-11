@@ -170,8 +170,10 @@ async def test_health_endpoint(client, pool):
         await conn.execute(
             """INSERT INTO device_health
                    (device_id, domain, computed_at, rth_baseline, rth_current,
-                    degradation_pct, health_score, data_quality, diagnosis, model_version)
-               VALUES ($1, 'cpu', now(), 1.0, 1.12, 12.0, 61, 'ok', 'tim_degradation', 1)""",
+                    degradation_pct, forecast_throttle_date, health_score,
+                    data_quality, diagnosis, model_version)
+               VALUES ($1, 'cpu', now(), 1.0, 1.12, 12.0, current_date + 90, 61,
+                       'ok', 'tim_degradation', 1)""",
             device_id,
         )
     body = (await client.get(
@@ -181,6 +183,7 @@ async def test_health_endpoint(client, pool):
     assert body[0]["diagnosis"] == "tim_degradation"
     assert body[0]["health_score"] == 61
     assert body[0]["degradation_pct"] == 12.0
+    assert body[0]["days_to_critical"] == 90       # вычисляется из forecast-даты
 
 
 async def test_trend_endpoint_with_auto_stratum(client, pool):

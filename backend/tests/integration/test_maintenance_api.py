@@ -119,3 +119,26 @@ async def test_maintenance_journal_listing(client):
         f"/api/v1/devices/{device_id}/maintenance", headers=_auth(token))).json()
     assert [e["maintenance_type"] for e in body] == ["repad", "paste_replacement"]
     assert body[1]["notes"] == "PTM7950 после чистки"
+
+
+async def test_suggested_regime_change_renders_in_journal(client, pool):
+    """CUSUM-предложение (kind вне пользовательского enum) обязано читаться
+    из журнала как есть, а POST юзера такой вид завести не может."""
+    token, _ = await register(client)
+    device_id, _ = await pair_device(client, token)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO maintenance_events (device_id, ts, kind, source, note)
+               VALUES ($1, now() - interval '2 days', 'regime_change',
+                       'changepoint_suggested', 'CUSUM: ступенька −18%')""",
+            device_id,
+        )
+
+    body = (await client.get(
+        f"/api/v1/devices/{device_id}/maintenance", headers=_auth(token))).json()
+    assert body[0]["maintenance_type"] == "regime_change"
+    assert body[0]["source"] == "changepoint_suggested"
+
+    rejected = await post_maintenance(
+        client, token, device_id, maintenance_type="regime_change")
+    assert rejected.status_code == 422

@@ -9,9 +9,11 @@ from tests.analytics.conftest import build_series
 P = AnalysisParams()
 
 
-def detect(ts, power, temp, params=P):
+def detect(ts, power, temp, params=P, until_s=None):
     rpm = np.full(ts.size, np.nan)
-    return detect_stable_windows(ts, power, temp, rpm, params)
+    windows, rejected, _open = detect_stable_windows(
+        ts, power, temp, rpm, params, until_s=until_s)
+    return windows, rejected
 
 
 def test_ideal_load_window():
@@ -125,3 +127,57 @@ def test_stratum_boundaries():
     assert stratum_of(40.0) == "p35_50"
     assert stratum_of(50.0) == "p50_80"
     assert stratum_of(80.0) == "p80plus"
+
+
+def test_open_run_at_right_edge_is_deferred():
+    """Сессия упирается в правый край запрошенного диапазона → окно НЕ
+    эмитится (обрезано границей, не концом нагрузки: CV на огрызке — фантом),
+    но начало рана возвращается для персиста и перечитки следующим прогоном."""
+    ts, power, temp = build_series([(30, 3.0, 45.0), (90, 62.0, 85.0)], tau_s=8.0)
+    rpm = np.full(ts.size, np.nan)
+    windows, rejected, open_ts = detect_stable_windows(
+        ts, power, temp, rpm, P, until_s=float(ts[-1]) + 1.0)
+    assert windows == []
+    assert rejected["open_right_edge"] == 1
+    assert open_ts is not None
+    assert ts[28] <= open_ts <= ts[40]      # начало рана ≈ вход в нагрузку
+
+    # перечитка от open_ts (как сделает следующий прогон, когда сессия
+    # закроется) даёт то же окно, что и обычная детекция полной серии
+    i0 = int(np.searchsorted(ts, open_ts))
+    matured, _, still_open = detect_stable_windows(
+        ts[i0:], power[i0:], temp[i0:], rpm[i0:], P,
+        until_s=float(ts[-1]) + P.gap_split_s + 5.0)
+    assert len(matured) == 1
+    assert still_open is None
+    full, _ = detect(ts, power, temp)
+    assert matured[0].start_ts == full[0].start_ts
+    assert matured[0].duration_s == full[0].duration_s
+
+
+def test_silence_before_until_closes_window():
+    """Агент молчит ≥ gap_split_s перед границей until — виртуальный гэп:
+    окно закрывается по последнему сэмплу, открытым не висит."""
+    ts, power, temp = build_series([(30, 3.0, 45.0), (90, 62.0, 85.0)], tau_s=8.0)
+    rpm = np.full(ts.size, np.nan)
+    windows, rejected, open_ts = detect_stable_windows(
+        ts, power, temp, rpm, P, until_s=float(ts[-1]) + P.gap_split_s + 5.0)
+    assert len(windows) == 1
+    assert open_ts is None
+    assert "open_right_edge" not in rejected
+
+
+def test_low_ambient_confidence_does_not_kill_good_window():
+    """Кейс с поля (i9-13900HX): ambient_confidence=0.10 из коротких шумных
+    эпизодов. Ошибка ambient — общий сдвиг уровня дня, не приговор точке:
+    хорошее окно обязано оставаться выше трендового гейта quality 0.5."""
+    ts, power, temp = build_series([(30, 3.0, 45.0), (90, 103.0, 97.0)], tau_s=8.0)
+    windows, _ = detect(ts, power, temp)
+    assert len(windows) == 1
+
+    points = attach_rth(windows, t_ambient=47.0, ambient_confidence=0.10, params=P)
+    assert points[0].stratum == "p80plus"
+    assert points[0].quality >= P.quality_min          # главный инвариант фикса
+    # ...но штраф остаётся монотонным: с полной уверенностью качество выше
+    full = attach_rth(windows, t_ambient=47.0, ambient_confidence=1.0, params=P)
+    assert full[0].quality > points[0].quality
