@@ -6,15 +6,23 @@ import dataclasses
 import json
 from dataclasses import dataclass
 
+import structlog
+
+log = structlog.get_logger(__name__)
+
 MODEL_VERSION = 1  # bump → reprocess пересчитает производные
 
 
 @dataclass(frozen=True)
 class AnalysisParams:
     # --- T_ambient (§5.2) ---
+    # Дефолты — «ультрабучный» простой; для десктопных чипов (i9-13900HX:
+    # реальный idle 13–22 Вт под фоновым Docker/WSL2) пороги задаются
+    # per-device в devices.analysis_overrides ЭТИМИ ЖЕ именами ключей.
     idle_power_w: float = 5.0        # порог скользящего среднего мощности
     idle_power_max_w: float = 8.0    # мгновенный потолок: сэмплы выше исключаются из оценки
     idle_rolling_s: int = 30
+    idle_grace_s: float = 60.0       # выброс среднего НАД порогом ≤ этого не рвёт эпизод
     idle_min_duration_s: float = 900.0    # эпизод ≥ 15 мин
     idle_discard_head_s: float = 600.0    # первые 10 мин — soak-back, в мусор
     idle_min_tail_s: float = 300.0        # после отброса должно остаться ≥ 5 мин
@@ -66,5 +74,13 @@ class AnalysisParams:
         if not overrides:
             return self
         known = {f.name for f in dataclasses.fields(self)}
+        unknown = sorted(set(overrides) - known)
+        if unknown:
+            # молчаливое игнорирование уже стоило одного потерянного вечера:
+            # пользователь писал idle_duration_min вместо idle_min_duration_s
+            log.warning(
+                "analytics.unknown_override_keys",
+                ignored=unknown, known_idle_keys=sorted(k for k in known if "idle" in k),
+            )
         clean = {k: v for k, v in overrides.items() if k in known}
         return dataclasses.replace(self, **clean) if clean else self

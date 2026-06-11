@@ -65,6 +65,25 @@ def rolling_mean(values: np.ndarray, width_s: int) -> np.ndarray:
     return out
 
 
+def bridge_short_gaps(mask: np.ndarray, ts: np.ndarray, max_gap_s: float) -> np.ndarray:
+    """False-раны длительностью ≤ max_gap_s СТРОГО МЕЖДУ True-ранами → True.
+
+    Один примитив на два применения: провалы мощности внутри окна нагрузки
+    (грейс 3с) и выбросы скользящего среднего над idle-порогом (грейс 60с —
+    без него маска «мерцает», когда медиана мощности ходит у самого порога,
+    как у i9-13900HX с фоновым Docker). Краевые False-раны не мостим:
+    окно/эпизод не должны начинаться или заканчиваться выбросом."""
+    if max_gap_s <= 0:
+        return mask.copy()
+    bridged = mask.copy()
+    for f0, f1 in runs(~mask):
+        if f0 == 0 or f1 == mask.size:
+            continue
+        if span_s(ts, f0, f1) <= max_gap_s:
+            bridged[f0:f1] = True
+    return bridged
+
+
 def geometric_mean(scores: list[float], floor: float = 0.05) -> float:
     """Композит качества: геом. среднее субскоров, каждый прижат к [floor, 1]."""
     clipped = np.clip(np.asarray(scores, dtype=float), floor, 1.0)

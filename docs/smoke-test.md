@@ -115,20 +115,40 @@ docker compose -f infra\docker-compose.yml exec timescaledb `
 
 ## 6. Если ambient_estimates пуст после простоя
 
-Вероятная причина на i9-13900HX: package power в «простое» Windows может не
-опускаться ниже 5 Вт (24 ядра + фон). Порог настраивается per-device без
-кода — поднять и пересчитать:
+Первым делом — диагностика (печатает эффективные пороги, профиль мощности,
+скан порогов с длиной ранов и найденные эпизоды):
 
 ```powershell
-docker compose -f infra\docker-compose.yml exec timescaledb `
-  psql -U postgres -d thermal -c `
-  "UPDATE devices SET analysis_overrides = '{\"idle_power_w\": 8.0, \"idle_power_max_w\": 12.0}'"
-docker compose -f infra\docker-compose.yml exec worker `
-  python -m app.analytics.worker --once estimate_ambient
+cd backend; .venv\Scripts\python.exe -m app.cli diagnose-ambient --hours 6
 ```
 
-Реальный idle-уровень видно так (нужно ~часовое окно данных):
-`GET .../timeseries?bucket=1m` → минимумы `cpu_power_avg`.
+Вероятная причина на i9-13900HX: idle package power 13–22 Вт (24 ядра +
+Docker/WSL2 фоном) — «ультрабучный» дефолт 5 Вт недостижим. Все пороги
+настраиваются per-device. **Точные имена ключей** (неизвестные ключи
+игнорируются с warning в логе воркера):
+
+| ключ | дефолт | смысл |
+|---|---|---|
+| `idle_power_w` | 5.0 | порог скользящего среднего, Вт |
+| `idle_power_max_w` | 8.0 | мгновенный потолок (сэмплы выше исключаются из оценки) |
+| `idle_grace_s` | 60 | выброс среднего над порогом ≤ этого не рвёт эпизод |
+| `idle_min_duration_s` | 900 | минимальная длительность эпизода, с |
+| `idle_discard_head_s` | 600 | отброс головы эпизода (soak-back), с |
+| `idle_min_tail_s` | 300 | минимальный хвост после отброса, с |
+| `ambient_clamp_high` | 45 | потолок оценки, °C — для горячего idle-профиля ПОДНЯТЬ |
+
+Проверенный профиль для этого Legion (idle ~14–22 Вт, температура простоя
+45–53 °C):
+
+```powershell
+docker compose -f infra\docker-compose.yml exec timescaledb psql -U postgres -d thermal -c "UPDATE devices SET analysis_overrides = '{\"idle_power_w\": 22.0, \"idle_power_max_w\": 28.0, \"idle_min_duration_s\": 300, \"idle_discard_head_s\": 180, \"idle_min_tail_s\": 120, \"ambient_clamp_high\": 60.0}'"
+docker compose -f infra\docker-compose.yml exec worker python -m app.analytics.worker --once estimate_ambient
+```
+
+Важно понимать: при пороге 22 Вт оценка — это температура кристалла в
+**опорном idle-режиме** (~47 °C на этой машине), а не комнатная. Для тренда
+деградации это равноценная опора: важна её консистентность, а не абсолют.
+Чем длиннее и спокойнее простой (ночь), тем выше confidence оценки.
 
 ## 7. Критерии успеха smoke-теста
 

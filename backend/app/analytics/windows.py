@@ -17,7 +17,14 @@ from dataclasses import dataclass
 import numpy as np
 
 from app.analytics.params import AnalysisParams
-from app.analytics.series import geometric_mean, median_filter, runs, span_s, split_on_gaps
+from app.analytics.series import (
+    bridge_short_gaps,
+    geometric_mean,
+    median_filter,
+    runs,
+    span_s,
+    split_on_gaps,
+)
 
 
 @dataclass(slots=True)
@@ -51,7 +58,7 @@ def detect_stable_windows(
 
     for s0, s1 in split_on_gaps(ts, params.gap_split_s):
         stay = np.where(np.isnan(power[s0:s1]), False, power[s0:s1] >= params.load_exit_w)
-        stay = _bridge_short_dips(stay, ts[s0:s1], params.dip_grace_s)
+        stay = bridge_short_gaps(stay, ts[s0:s1], params.dip_grace_s)
         for r0, r1 in runs(stay):
             seg_power = power[s0 + r0 : s0 + r1]
             above_enter = np.flatnonzero(seg_power > params.load_enter_w)
@@ -64,18 +71,6 @@ def detect_stable_windows(
                 if stats is not None:
                     out.append(stats)
     return out, rejected
-
-
-def _bridge_short_dips(stay: np.ndarray, ts: np.ndarray, grace_s: float) -> np.ndarray:
-    """Провалы (False) длительностью ≤ grace_s СТРОГО МЕЖДУ True-ранами → True.
-    Провалы на краях сегмента не мостим: окно не должно начинаться/кончаться дипом."""
-    bridged = stay.copy()
-    for f0, f1 in runs(~stay):
-        if f0 == 0 or f1 == stay.size:
-            continue
-        if span_s(ts, f0, f1) <= grace_s:
-            bridged[f0:f1] = True
-    return bridged
 
 
 def _chunks(ts: np.ndarray, w0: int, w1: int, max_s: float) -> list[tuple[int, int]]:

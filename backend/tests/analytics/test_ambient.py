@@ -68,6 +68,48 @@ def test_background_bursts_do_not_shatter_episode():
     assert abs(episodes[0].estimate - 31.5) < 0.3
 
 
+def test_short_mean_excursion_bridged_by_grace():
+    """Маска «мерцает» у порога: 20-секундный фоновый burst поднимает
+    скользящее среднее над idle_power_w на ~45с — грейс 60с мостит, эпизод
+    ОДИН. Без грейса эпизод рассыпался бы на две половины < 15 мин → ноль."""
+    n = 26 * 60
+    ts = np.arange(n, dtype=float)
+    power = np.full(n, 3.0)
+    power[13 * 60 : 13 * 60 + 20] = 20.0          # всплеск Docker/индексатора
+    temp = np.full(n, 31.5)
+
+    episodes = find_idle_episodes(ts, power, temp, P)
+    assert len(episodes) == 1
+    assert abs(episodes[0].estimate - 31.5) < 0.3
+
+    no_grace = AnalysisParams(idle_grace_s=0.0)
+    assert find_idle_episodes(ts, power, temp, no_grace) == []
+
+
+def test_desktop_class_profile_with_overrides():
+    """Профиль i9-13900HX: простой 13–22 Вт, дефолтные 5 Вт не дают ничего,
+    оверрайды (как в devices.analysis_overrides) — дают эпизод и оценку."""
+    n = 20 * 60
+    ts = np.arange(n, dtype=float)
+    rng = np.random.default_rng(13)
+    power = rng.uniform(14.0, 21.0, n)             # «idle» большого чипа
+    temp = np.full(n, 47.0) + rng.normal(0, 0.2, n)
+
+    assert find_idle_episodes(ts, power, temp, P) == []   # ультрабучный порог слеп
+
+    hx = AnalysisParams().with_overrides({
+        "idle_power_w": 22.0, "idle_power_max_w": 28.0,
+        "idle_min_duration_s": 300, "idle_discard_head_s": 180,
+        "idle_min_tail_s": 120, "ambient_clamp_high": 60.0,
+    })
+    episodes = find_idle_episodes(ts, power, temp, hx)
+    assert len(episodes) == 1
+    day = estimate_day_ambient(episodes, hx)
+    assert day is not None
+    assert abs(day.t_ambient - 47.0) < 0.5         # p10 стабильного хвоста
+    assert day.t_ambient < hx.ambient_clamp_high   # кламп поднят — не душит
+
+
 def test_sustained_activity_breaks_episode():
     """60с устойчивой нагрузки 25 Вт — это уже не простой: эпизод рвётся."""
     n = 40 * 60

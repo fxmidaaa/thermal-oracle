@@ -5,21 +5,37 @@
 отбрасываются полностью (радиатор ещё тёплый после нагрузки и завышает оценку),
 по остатку берётся низкий перцентиль (фоновая активность смещает только вверх).
 
-Семантика порогов (важное уточнение к ТЗ): непрерывность эпизода определяет
-СКОЛЬЗЯЩЕЕ СРЕДНЕЕ 30с < 5 Вт; мгновенный потолок 8 Вт не рвёт эпизод, а лишь
-исключает сэмплы из оценки температуры. Иначе штатные 2-секундные всплески
-фоновых задач (индексатор и т.п.) рассыпали бы любой реальный простой в пыль.
+Семантика порогов — ВСЕ числа приходят из AnalysisParams (дефолты под
+ультрабук; per-device значения — devices.analysis_overrides, см. params.py):
+- непрерывность эпизода определяет СКОЛЬЗЯЩЕЕ СРЕДНЕЕ idle_rolling_s секунд
+  < idle_power_w; выбросы среднего НАД порогом короче idle_grace_s эпизод не
+  рвут (без этого маска «мерцает» на устройствах, чья медиана простоя ходит
+  у самого порога — i9-13900HX с фоновым Docker/WSL2: p50 ≈ 21 Вт при пороге 22);
+- мгновенный потолок idle_power_max_w не рвёт эпизод, а лишь исключает сэмплы
+  из оценки температуры (иначе 2-секундные всплески индексатора рассыпали бы
+  любой простой в пыль);
+- оценка эпизода = перцентиль ambient_percentile (дефолт p10) сглаженного
+  стабильного хвоста после отброса idle_discard_head_s.
 
-Систематика документирована: T_idle_die ≈ T_room + 2–4 °C. Для ТРЕНДА
-деградации постоянное смещение безвредно, а сезонный ход комнатной температуры
-этим механизмом как раз вычитается.
+Систематика документирована: T_idle_die ≈ T_room + P_idle·Rth. Для ультрабука
+это +2–4 °C; для чипа с простоем 15–25 Вт прокси сидит на +15–25 °C над
+комнатой — это НЕ комнатная температура, а «температура в опорном
+idle-режиме». Для ТРЕНДА деградации годится так же: важна консистентность
+опоры, а не её абсолют (и не забыть поднять ambient_clamp_high в overrides).
 """
 from dataclasses import dataclass
 
 import numpy as np
 
 from app.analytics.params import AnalysisParams
-from app.analytics.series import median_filter, rolling_mean, runs, span_s, split_on_gaps
+from app.analytics.series import (
+    bridge_short_gaps,
+    median_filter,
+    rolling_mean,
+    runs,
+    span_s,
+    split_on_gaps,
+)
 
 
 @dataclass(slots=True)
@@ -47,6 +63,8 @@ def find_idle_episodes(
             continue
         smooth = rolling_mean(power[s0:s1], params.idle_rolling_s)
         idle_mask = np.where(np.isnan(smooth), False, smooth < params.idle_power_w)
+        # короткий выброс среднего над порогом (фоновый burst) не рвёт эпизод
+        idle_mask = bridge_short_gaps(idle_mask, ts[s0:s1], params.idle_grace_s)
         for r0, r1 in runs(idle_mask):
             i0, i1 = s0 + r0, s0 + r1
             duration = span_s(ts, i0, i1)
