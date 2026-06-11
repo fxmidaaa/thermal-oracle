@@ -121,6 +121,42 @@ async def test_maintenance_journal_listing(client):
     assert body[1]["notes"] == "PTM7950 после чистки"
 
 
+async def test_suggestions_list_and_confirmation_flow(client, pool):
+    """Открытое предложение видно в /maintenance-suggestions; подтверждение —
+    обычный POST /maintenance в ±3 дня от него — закрывает предложение,
+    но журнал хранит обе записи (история не удаляется)."""
+    token, _ = await register(client)
+    device_id, _ = await pair_device(client, token)
+    suggested_ts = NOW() - dt.timedelta(days=5)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO maintenance_events (device_id, ts, kind, source, note)
+               VALUES ($1, $2, 'regime_change', 'changepoint_suggested',
+                       'CUSUM: ступенька вниз на 18.0% (cpu/p50_80)')""",
+            device_id, suggested_ts,
+        )
+
+    url = f"/api/v1/devices/{device_id}/maintenance-suggestions"
+    body = (await client.get(url, headers=_auth(token))).json()
+    assert len(body) == 1
+    assert "CUSUM" in body[0]["note"]
+    suggested_at = dt.datetime.fromisoformat(body[0]["suggested_at"])
+    assert abs((suggested_at - suggested_ts).total_seconds()) < 1
+
+    # кнопка «Подтвердить» на фронте = существующий POST /maintenance
+    confirmed = await post_maintenance(
+        client, token, device_id,
+        maintenance_type="dust_cleaning", tim_type=None,
+        performed_at=(suggested_ts + dt.timedelta(hours=12)).isoformat(),
+    )
+    assert confirmed.status_code == 201
+
+    assert (await client.get(url, headers=_auth(token))).json() == []
+    journal = (await client.get(
+        f"/api/v1/devices/{device_id}/maintenance", headers=_auth(token))).json()
+    assert len(journal) == 2                  # предложение осталось историей
+
+
 async def test_suggested_regime_change_renders_in_journal(client, pool):
     """CUSUM-предложение (kind вне пользовательского enum) обязано читаться
     из журнала как есть, а POST юзера такой вид завести не может."""

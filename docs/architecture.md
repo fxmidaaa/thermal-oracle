@@ -602,10 +602,21 @@ GET  /api/v1/devices/{id}/timeseries?bucket=1m|1h&from=&to=  → из CAggs
 POST /api/v1/devices/{id}/maintenance    ← paste_replacement|dust_cleaning|repad
                                            (+performed_at, notes, tim_type) —
                                            новая эпоха, мгновенный пересчёт health
-GET  /api/v1/devices/{id}/maintenance    → журнал
+GET  /api/v1/devices/{id}/maintenance    → журнал (включая CUSUM-предложения)
+
+— дашборд (реализовано, v3):
+GET  /api/v1/devices/{id}/current-health → шапка одним запросом: последняя
+                                           ambient-оценка + по доменам последняя
+                                           честная Rth-точка, score, days_to_critical
+GET  /api/v1/devices/{id}/rth-history?domain=&stratum=&days=  → скаттер окон
+                                           ≥ per-device гейта качества (days ≤ 90;
+                                           длинные горизонты — /trend)
+GET  /api/v1/devices/{id}/maintenance-suggestions  → открытые CUSUM-предложения;
+                                           подтверждение = POST /maintenance в
+                                           ±3 дня (закрывает предложение)
 
 — запланировано (v1.1+):
-GET  /api/v1/devices/{id}/ambient · GET /api/v1/alerts + ack · ротация токенов
+история ambient-оценок · GET /api/v1/alerts + ack · ротация токенов
 ```
 
 Горячий путь ingest: Pydantic → auth (LRU-кэш девайса) → диапазонные проверки →

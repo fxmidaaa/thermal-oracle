@@ -3,6 +3,8 @@
 import datetime as dt
 import uuid
 
+import pytest
+
 from app.security import create_access_token
 from app.settings import Settings
 from tests.integration.conftest import PASSWORD, _auth, _email, pair_device, register
@@ -151,6 +153,9 @@ async def test_tenant_isolation(client):
     assert (await client.get("/api/v1/devices", headers=_auth(token_b))).json() == []
 
     for path in (f"/api/v1/devices/{device_a}/health",
+                 f"/api/v1/devices/{device_a}/current-health",
+                 f"/api/v1/devices/{device_a}/rth-history",
+                 f"/api/v1/devices/{device_a}/maintenance-suggestions",
                  f"/api/v1/devices/{device_a}/trend",
                  f"/api/v1/devices/{device_a}/timeseries"):
         response = await client.get(path, headers=_auth(token_b))
@@ -184,6 +189,101 @@ async def test_health_endpoint(client, pool):
     assert body[0]["health_score"] == 61
     assert body[0]["degradation_pct"] == 12.0
     assert body[0]["days_to_critical"] == 90       # вычисляется из forecast-даты
+
+
+async def _insert_window(conn, device_id, *, domain="cpu", days_back=0.0,
+                         rth=1.0, quality=0.8, stratum="p50_80"):
+    await conn.execute(
+        """INSERT INTO rth_windows
+               (device_id, domain, window_start, window_end, duration_s,
+                p_tail, p_cv, t_tail, dtdt_tail, t_ambient,
+                ambient_confidence, rth, stratum, quality, model_version)
+           VALUES ($1, $2, $3::timestamptz,
+                   $3::timestamptz + interval '60 seconds', 60,
+                   60.0, 0.05, 85.0, 0.01, 25.0, 0.9, $4, $5, $6, 1)""",
+        device_id, domain,
+        dt.datetime.now(dt.UTC) - dt.timedelta(days=days_back),
+        rth, stratum, quality,
+    )
+
+
+async def test_current_health_endpoint(client, pool):
+    """Агрегат шапки: ambient + последняя ЧЕСТНАЯ точка (свежее окно ниже
+    гейта не подменяет её) + sparse-снапшот с нуллами вместо цифр."""
+    token, _ = await register(client)
+    device_id, _ = await pair_device(client, token)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO ambient_estimates
+                   (device_id, day, t_ambient, confidence, idle_minutes,
+                    episodes_n, method, model_version)
+               VALUES ($1, current_date, 47.0, 0.17, 31, 4, 'idle_p10_v1', 1)""",
+            device_id,
+        )
+        await conn.execute(
+            """INSERT INTO device_health
+                   (device_id, domain, computed_at, rth_current, data_quality,
+                    diagnosis, model_version)
+               VALUES ($1, 'cpu', now(), 0.33, 'sparse', 'insufficient_data', 1)""",
+            device_id,
+        )
+        await _insert_window(conn, device_id, days_back=0.10, rth=0.45, quality=0.8)
+        await _insert_window(conn, device_id, days_back=0.05, rth=9.90, quality=0.30)
+
+    body = (await client.get(
+        f"/api/v1/devices/{device_id}/current-health", headers=_auth(token))).json()
+    assert body["t_ambient"] == 47.0
+    assert abs(body["ambient_confidence"] - 0.17) < 0.005
+    assert len(body["domains"]) == 1                   # gpu без данных не приходит
+    cpu = body["domains"][0]
+    assert cpu["domain"] == "cpu"
+    assert cpu["rth_latest"] == pytest.approx(0.45)    # мусорная точка не пролезла
+    assert cpu["rth_current"] == pytest.approx(0.33)
+    assert cpu["health_score"] is None                 # sparse — честный null
+    assert cpu["data_quality"] == "sparse"
+    assert cpu["days_to_critical"] is None
+
+
+async def test_current_health_empty_device(client):
+    """Свежеспаренное устройство: 200 с пустыми полями, не 404/500."""
+    token, _ = await register(client)
+    device_id, _ = await pair_device(client, token)
+    body = (await client.get(
+        f"/api/v1/devices/{device_id}/current-health", headers=_auth(token))).json()
+    assert body["t_ambient"] is None
+    assert body["domains"] == []
+
+
+async def test_rth_history_respects_gate_window_and_overrides(client, pool):
+    """Скаттер: только домен cpu, только окна ≥ per-device гейта, только
+    период days; ASC; поднятый через overrides гейт сужает выборку."""
+    token, _ = await register(client)
+    device_id, _ = await pair_device(client, token)
+    async with pool.acquire() as conn:
+        await _insert_window(conn, device_id, days_back=2, rth=0.40, quality=0.55)
+        await _insert_window(conn, device_id, days_back=1, rth=0.42, quality=0.80)
+        await _insert_window(conn, device_id, days_back=40, rth=0.38, quality=0.80)
+        await _insert_window(conn, device_id, days_back=1, rth=0.10, quality=0.30)
+        await _insert_window(conn, device_id, days_back=1, rth=0.50, quality=0.80,
+                             domain="gpu")
+
+    url = f"/api/v1/devices/{device_id}/rth-history"
+    body = (await client.get(url, headers=_auth(token))).json()
+    assert body["domain"] == "cpu" and body["days"] == 30
+    assert body["quality_gate"] == 0.5
+    # ASC, без мусора и чужих доменов
+    assert [p["rth"] for p in body["points"]] == pytest.approx([0.40, 0.42])
+
+    body = (await client.get(url + "?days=90", headers=_auth(token))).json()
+    assert len(body["points"]) == 3                    # старая точка вернулась
+
+    async with pool.acquire() as conn:                 # фронт видит гейт устройства
+        await conn.execute(
+            """UPDATE devices SET analysis_overrides = '{"quality_min": 0.7}'::jsonb
+               WHERE id = $1""", device_id)
+    body = (await client.get(url, headers=_auth(token))).json()
+    assert body["quality_gate"] == 0.7
+    assert [p["rth"] for p in body["points"]] == pytest.approx([0.42])
 
 
 async def test_trend_endpoint_with_auto_stratum(client, pool):

@@ -9,11 +9,16 @@ from app.analytics.jobs import update_trends_for_device
 from app.analytics.params import AnalysisParams
 from app.api.v1.deps import get_current_user, get_owned_device
 from app.schemas.devices import (
+    CurrentHealthOut,
     DeviceOut,
+    DomainCurrentOut,
     HealthOut,
     MaintenanceOut,
     MaintenanceRequest,
+    MaintenanceSuggestionOut,
     PairingCodeOut,
+    RthHistoryOut,
+    RthHistoryPoint,
     TimeseriesPoint,
     TrendOut,
     TrendPoint,
@@ -33,6 +38,19 @@ _KIND_TO_MAINT_TYPE = {v: k for k, v in _MAINT_TYPE_TO_KIND.items()}
 _TS_TABLES = {"1m": "telemetry_1m", "1h": "telemetry_1h"}
 _TS_DEFAULT = {"1m": dt.timedelta(hours=24), "1h": dt.timedelta(days=7)}
 _TS_MAX = {"1m": dt.timedelta(hours=48), "1h": dt.timedelta(days=90)}
+
+
+def _days_to(date: dt.date | None) -> int | None:
+    return (date - dt.date.today()).days if date is not None else None
+
+
+async def _device_quality_gate(conn, device_id: uuid.UUID) -> float:
+    """Эффективный трендовый гейт качества: дефолт + devices.analysis_overrides
+    (тот же путь, что в analytics-джобах, — фронт видит ровно те точки,
+    которые видит тренд)."""
+    overrides = await conn.fetchval(
+        "SELECT analysis_overrides FROM devices WHERE id = $1", device_id)
+    return AnalysisParams().with_overrides(overrides).quality_min
 
 
 @router.get("", response_model=list[DeviceOut])
@@ -115,6 +133,36 @@ async def list_maintenance(
     ]
 
 
+@router.get(
+    "/{device_id}/maintenance-suggestions",
+    response_model=list[MaintenanceSuggestionOut],
+)
+async def list_maintenance_suggestions(
+    request: Request, device_id: uuid.UUID = Depends(get_owned_device)
+) -> list[MaintenanceSuggestionOut]:
+    """Открытые CUSUM-предложения «подтвердите смену режима» (§5.5).
+    Подтверждение — обычный POST /maintenance с performed_at ≈ suggested_at:
+    user-событие в ±3 дня закрывает предложение (то же окно, что у дедупа
+    самих предложений), отдельного write-эндпоинта не нужно."""
+    async with request.app.state.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT s.id, s.ts, s.note
+               FROM maintenance_events s
+               WHERE s.device_id = $1 AND s.source = 'changepoint_suggested'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM maintenance_events u
+                     WHERE u.device_id = s.device_id AND u.source = 'user'
+                       AND u.ts BETWEEN s.ts - interval '3 days'
+                                    AND s.ts + interval '3 days')
+               ORDER BY s.ts DESC""",
+            device_id,
+        )
+    return [
+        MaintenanceSuggestionOut(id=r["id"], suggested_at=r["ts"], note=r["note"])
+        for r in rows
+    ]
+
+
 @router.get("/{device_id}/health", response_model=list[HealthOut])
 async def device_health(
     request: Request, device_id: uuid.UUID = Depends(get_owned_device)
@@ -127,17 +175,95 @@ async def device_health(
                FROM device_health WHERE device_id = $1 ORDER BY domain""",
             device_id,
         )
-    today = dt.date.today()
     return [
-        HealthOut(
-            **dict(r),
-            days_to_critical=(
-                (r["forecast_throttle_date"] - today).days
-                if r["forecast_throttle_date"] is not None else None
-            ),
-        )
+        HealthOut(**dict(r), days_to_critical=_days_to(r["forecast_throttle_date"]))
         for r in rows
     ]
+
+
+@router.get("/{device_id}/current-health", response_model=CurrentHealthOut)
+async def device_current_health(
+    request: Request, device_id: uuid.UUID = Depends(get_owned_device)
+) -> CurrentHealthOut:
+    """Шапка дашборда одним запросом: последняя ambient-калибровка + по каждому
+    домену последняя честная Rth-точка и снапшот health. Домены без единой
+    точки и без снапшота не возвращаются; новое устройство → domains=[]."""
+    async with request.app.state.pool.acquire() as conn:
+        gate = await _device_quality_gate(conn, device_id)
+        ambient = await conn.fetchrow(
+            """SELECT day, t_ambient, confidence FROM ambient_estimates
+               WHERE device_id = $1 ORDER BY day DESC LIMIT 1""",
+            device_id,
+        )
+        latest = {
+            r["domain"]: r
+            for r in await conn.fetch(
+                """SELECT DISTINCT ON (domain) domain, rth, window_start
+                   FROM rth_windows
+                   WHERE device_id = $1 AND quality >= $2
+                   ORDER BY domain, window_start DESC""",
+                device_id, gate,
+            )
+        }
+        health = {
+            r["domain"]: r
+            for r in await conn.fetch(
+                """SELECT domain, rth_current, health_score, data_quality,
+                          forecast_throttle_date
+                   FROM device_health WHERE device_id = $1""",
+                device_id,
+            )
+        }
+
+    domains = []
+    for domain in ("cpu", "gpu"):
+        if domain not in latest and domain not in health:
+            continue
+        win, snap = latest.get(domain), health.get(domain)
+        domains.append(DomainCurrentOut(
+            domain=domain,
+            rth_latest=win["rth"] if win else None,
+            rth_latest_at=win["window_start"] if win else None,
+            rth_current=snap["rth_current"] if snap else None,
+            health_score=snap["health_score"] if snap else None,
+            data_quality=snap["data_quality"] if snap else None,
+            days_to_critical=_days_to(snap["forecast_throttle_date"]) if snap else None,
+        ))
+    return CurrentHealthOut(
+        t_ambient=ambient["t_ambient"] if ambient else None,
+        ambient_confidence=ambient["confidence"] if ambient else None,
+        ambient_day=ambient["day"] if ambient else None,
+        domains=domains,
+    )
+
+
+@router.get("/{device_id}/rth-history", response_model=RthHistoryOut)
+async def device_rth_history(
+    request: Request,
+    device_id: uuid.UUID = Depends(get_owned_device),
+    domain: str = Query("cpu", pattern="^(cpu|gpu)$"),
+    stratum: str | None = Query(None, pattern="^(p35_50|p50_80|p80plus)$"),
+    days: int = Query(30, ge=1, le=90),
+) -> RthHistoryOut:
+    """Скаттер отдельных Rth-окон для графика — только точки, прошедшие
+    per-device трендовый гейт качества. Дневные агрегаты и длинные горизонты —
+    GET /trend. Нет данных → честный пустой points (дашборд это переживает)."""
+    async with request.app.state.pool.acquire() as conn:
+        gate = await _device_quality_gate(conn, device_id)
+        rows = await conn.fetch(
+            """SELECT window_start, duration_s, rth, p_tail, stratum, quality,
+                      fan_rpm_avg
+               FROM rth_windows
+               WHERE device_id = $1 AND domain = $2 AND quality >= $3
+                 AND window_start >= now() - make_interval(days => $4)
+                 AND ($5::text IS NULL OR stratum = $5)
+               ORDER BY window_start""",
+            device_id, domain, gate, days, stratum,
+        )
+    return RthHistoryOut(
+        domain=domain, days=days, quality_gate=gate,
+        points=[RthHistoryPoint(**dict(r)) for r in rows],
+    )
 
 
 @router.get("/{device_id}/trend", response_model=TrendOut)

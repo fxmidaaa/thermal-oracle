@@ -90,6 +90,55 @@ class MaintenanceOut(BaseModel):
     source: str
 
 
+class DomainCurrentOut(BaseModel):
+    """Срез одного домена для шапки дашборда. Все поля честно nullable:
+    в свежей эпохе health_score ещё null (data_quality='sparse')."""
+    domain: str
+    rth_latest: float | None             # последнее окно, прошедшее гейт качества
+    rth_latest_at: dt.datetime | None
+    rth_current: float | None            # 7-дневная медиана внутри эпохи
+    health_score: int | None
+    data_quality: str | None             # null — update_trends ещё не считал домен
+    days_to_critical: int | None         # null — тренд не значим / не строится
+
+
+class CurrentHealthOut(BaseModel):
+    """Агрегат «одним запросом»: ambient-калибровка + срезы доменов.
+    Подробности по домену (базлайн, наклон, CI, диагноз) — GET /health."""
+    t_ambient: float | None              # последняя дневная оценка опоры
+    ambient_confidence: float | None
+    ambient_day: dt.date | None
+    domains: list[DomainCurrentOut]
+
+
+class RthHistoryPoint(BaseModel):
+    window_start: dt.datetime
+    duration_s: int
+    rth: float
+    p_tail: float
+    stratum: str
+    quality: float
+    fan_rpm_avg: float | None
+
+
+class RthHistoryOut(BaseModel):
+    """Скаттер честных Rth-точек для графика. Длинные горизонты — у /trend
+    (дневные агрегаты), поэтому days ≤ 90."""
+    domain: str
+    days: int
+    quality_gate: float                  # эффективный per-device гейт фильтра
+    points: list[RthHistoryPoint]
+
+
+class MaintenanceSuggestionOut(BaseModel):
+    """Неподтверждённое CUSUM-предложение. Кнопка «подтвердить» на фронте —
+    это обычный POST /maintenance с performed_at ≈ suggested_at: предложение
+    исчезнет из этого списка, но останется в журнале как история."""
+    id: int
+    suggested_at: dt.datetime            # полночь дня ступеньки (локаль устройства)
+    note: str | None
+
+
 class TimeseriesPoint(BaseModel):
     bucket: dt.datetime
     cpu_temp_avg: float | None
