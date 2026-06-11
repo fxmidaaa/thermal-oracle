@@ -1,0 +1,85 @@
+{
+  "id": 0, "Text": "Sensor", "Children": [
+    {
+      "id": 1, "Text": "DESKTOP-TEST", "ImageURL": "images_icon/computer.png",
+      "Children": [
+        {
+          "id": 10, "Text": "AMD Ryzen 7 5800H", "ImageURL": "images_icon/cpu.png",
+          "Children": [
+            {
+              "id": 11, "Text": "Temperatures", "Children": [
+                {"id": 12, "Text": "Core (Tctl/Tdie)", "Min": "41,0 °C", "Value": "62,0 °C", "Max": "95,1 °C"},
+                {"id": 13, "Text": "CCD1 (Tdie)", "Min": "40,2 °C", "Value": "60,5 °C", "Max": "92,3 °C"},
+                {"id": 14, "Text": "Distance to TjMax", "Min": "5,0 °C", "Value": "33,0 °C", "Max": "54,0 °C"}
+              ]
+            },
+            {
+              "id": 15, "Text": "Powers", "Children": [
+                {"id": 16, "Text": "CPU Package", "Min": "8,1 W", "Value": "45,2 W", "Max": "88,0 W"},
+                {"id": 17, "Text": "CPU Cores", "Min": "2,0 W", "Value": "38,9 W", "Max": "80,2 W"}
+              ]
+            },
+            {
+              "id": 18, "Text": "Clocks", "Children": [
+                {"id": 19, "Text": "Core #1", "Value": "4 350,5 MHz"}
+              ]
+            }
+          ]
+        },
+        {
+          "id": 20, "Text": "AMD Radeon(TM) Graphics", "ImageURL": "images_icon/ati.png",
+          "Children": [
+            {
+              "id": 21, "Text": "Temperatures", "Children": [
+                {"id": 22, "Text": "GPU Core", "Value": "48,0 °C"}
+              ]
+            }
+          ]
+        },
+        {
+          "id": 30, "Text": "NVIDIA GeForce RTX 3070 Laptop GPU", "ImageURL": "images_icon/nvidia.png",
+          "Children": [
+            {
+              "id": 31, "Text": "Temperatures", "Children": [
+                {"id": 32, "Text": "GPU Core", "Value": "52,0 °C"},
+                {"id": 33, "Text": "GPU Hot Spot", "Value": "64,0 °C"}
+              ]
+            },
+            {
+              "id": 34, "Text": "Powers", "Children": [
+                {"id": 35, "Text": "GPU Package", "Value": "85,7 W"}
+              ]
+            },
+            {
+              "id": 36, "Text": "Fans", "Children": [
+                {"id": 37, "Text": "GPU Fan", "Value": "2 100 RPM"}
+              ]
+            }
+          ]
+        },
+        {
+          "id": 40, "Text": "MSI MS-7C91", "ImageURL": "images_icon/mainboard.png",
+          "Children": [
+            {
+              "id": 41, "Text": "ITE IT8689E", "ImageURL": "images_icon/chip.png",
+              "Children": [
+                {
+                  "id": 42, "Text": "Fans", "Children": [
+                    {"id": 43, "Text": "Fan #1", "Value": "0 RPM"},
+                    {"id": 44, "Text": "Fan #2", "Value": "3 540 RPM"},
+                    {"id": 45, "Text": "Fan #3", "Value": "-"}
+                  ]
+                },
+                {
+                  "id": 46, "Text": "Controls", "Children": [
+                    {"id": 47, "Text": "Fan Control #2", "Value": "61,0 %"}
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+# Весь серверный стек одной командой:
+#   docker compose -f infra/docker-compose.yml up -d --build
+# Порядок: timescaledb (healthy) → migrate (one-shot) → api + worker.
+x-backend-env: &backend-env
+  THERMAL_DATABASE_URL: postgresql://postgres:postgres@timescaledb:5432/thermal
+  # dev-секрет; в проде задать свой (≥ 32 байт)
+  THERMAL_JWT_SECRET: dev-compose-secret-change-in-production-123456
+
+services:
+  timescaledb:
+    # latest-pg16 — для dev; перед прод-деплоем зафиксировать конкретный тег
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: thermal
+    ports:
+      # 5433 на хосте: локальные инструменты (pytest, psql, dev-CLI) ходят сюда
+      - "5433:5432"
+    volumes:
+      - tsdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d thermal"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build: ../backend
+    image: thermal-oracle-backend:dev
+    command: alembic upgrade head
+    environment: *backend-env
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  api:
+    build: ../backend
+    image: thermal-oracle-backend:dev
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment: *backend-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # slim-образ без curl — проверяем штатным python
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  worker:
+    build: ../backend
+    image: thermal-oracle-backend:dev
+    command: python -m app.analytics.worker
+    environment: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  tsdata:
