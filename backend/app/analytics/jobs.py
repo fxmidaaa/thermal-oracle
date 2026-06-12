@@ -323,7 +323,8 @@ async def update_trends_for_device(
             # §5.5: чейнджпойнт ⇒ предложение подтвердить событие обслуживания.
             # Эпоху НЕ режет (kind не в EPOCH_RESET_KINDS) — псевдо-граница
             # тренда уже обеспечена сегментом seg; базлайн ждёт подтверждения.
-            step_pct = 100.0 * (medians[seg] - medians[seg - 1]) / medians[seg - 1]
+            # float(): иначе np.float64 протекает в structlog-вывод и note
+            step_pct = float(100.0 * (medians[seg] - medians[seg - 1]) / medians[seg - 1])
             await _suggest_regime_change(
                 conn, device_id, domain, stratum,
                 daily[seg]["day"], step_pct, _tz(tz_name),

@@ -689,8 +689,10 @@ thermal_oracle/
 машины пользователей); контракт — это версионированный JSON, совместимость
 держат contract-тесты в `backend/tests/contract/`.
 
-Frontend-дашборда в v1 нет (API self-sufficient, для dev — Grafana поверх
-CAggs); появится как `frontend/` в v2.
+Frontend-дашборд — `frontend/` (Vite + React + TS + Tailwind v4 + Recharts):
+логин, KPI-карты, скаттер Rth с базлайном эпохи, подтверждение
+CUSUM-предложений. Типы ответов зеркалят `backend/app/schemas/devices.py`
+(`src/types.ts`), dev-прокси вместо CORS — детали в `frontend/README.md`.
 
 ## 8. Реестр ключевых решений и трейд-офф
 
